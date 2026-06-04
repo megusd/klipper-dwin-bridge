@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # run_tests.sh - activate venv, run pytest, print PASS/FAIL
-# Usage: ./run_tests.sh [venv_path]
+# Usage: ./scripts/run_tests.sh [venv_path]
 
 VENV_PATH=${1:-.venv}
 
 # Resolve repository root (script directory)
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-PROJECT_ROOT="$SCRIPT_DIR"
+PROJECT_ROOT="${SCRIPT_DIR%/scripts}"
 SRC_PATH="$PROJECT_ROOT/src"
 
 if [ -d "$VENV_PATH" ]; then
