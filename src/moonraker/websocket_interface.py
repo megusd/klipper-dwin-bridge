@@ -193,93 +193,101 @@ from distutils.log import error
 
     def ws_on_message(self, ws_app, msg):
         response = json.loads(msg)
-        #print(json.dumps(response, indent=3))
-        #global json_data_modell
+        # Defensive access to response keys to avoid KeyErrors
+        resp_id = response.get("id", None)
 
-        if 'id' in response:
-            # Response to our query data request 
-            if response["id"] == WebsocktRequestId.QUERY_PRINTER_OBJECTS:
-                #print(json.dumps(response, indent=2))
+        if resp_id is not None:
+            # Handle QUERY_PRINTER_OBJECTS
+            if resp_id == WebsocktRequestId.QUERY_PRINTER_OBJECTS:
+                status = None
+                result = response.get("result")
+                if result is None:
+                    self._logger.debug("Missing key: response.result for QUERY_PRINTER_OBJECTS; using default None")
+                else:
+                    status = result.get("status")
+                    if status is None:
+                        self._logger.debug("Missing key: response.result.status for QUERY_PRINTER_OBJECTS; using default None")
+
+                if status is not None:
+                    with self.json_resouce_lock:
+                        try:
+                            json_merged = merge(self.json_data_modell, status)
+                            self.json_data_modell = json_merged
+                        except Exception:
+                            self._logger.exception("Failed to merge printer objects status")
+                    self.add_subscription(ws_app)
+
+            # Handle QUERY_SERVER_INFO
+            if resp_id == WebsocktRequestId.QUERY_SERVER_INFO:
+                result = response.get("result", {})
+                if not result:
+                    self._logger.debug("Missing key: response.result for QUERY_SERVER_INFO; storing empty result")
                 with self.json_resouce_lock:
-                    json_merged = merge(self.json_data_modell, response["result"]["status"])
-                    self.json_data_modell = json_merged
-
-                #print(json.dumps(self.json_data_modell, indent=3))
-            
-                self.add_subscription(ws_app)
-
-            if response["id"] == WebsocktRequestId.QUERY_SERVER_INFO:
-                #print(json.dumps(response, indent=3))
-
-                #self.server_info = response["resut"]
-                with self.json_resouce_lock:
-                    # Be defensive: the data model may not contain a server_info key yet
                     existing = self.json_data_modell.get("server_info", {}) if isinstance(self.json_data_modell, dict) else {}
-                    result = response.get("result", {}) if isinstance(response, dict) else {}
                     try:
                         json_merged = merge(existing, result)
                         self.json_data_modell["server_info"] = json_merged
                     except Exception:
-                        # If merging fails for any reason, log and store the raw result safely
                         self._logger.exception("Failed to merge server_info response")
                         self.json_data_modell["server_info"] = result
 
-                    #print(json.dumps(response, indent=3))
-
-            #if response["id"] == 8000:
-            #    print(json.dumps(response, indent=3))
-
-            if response["id"] == WebsocktRequestId.QUERY_PRINTER_INFO:
-                #print(json.dumps(response, indent=3))
-
-                if 'result' in response:
-                    state_string = response["result"]["state"]
-                    state_message = response["result"]["state_message"]
+            # Handle QUERY_PRINTER_INFO
+            if resp_id == WebsocktRequestId.QUERY_PRINTER_INFO:
+                result = response.get("result", {})
+                if not result:
+                    self._logger.debug("Missing key: response.result for QUERY_PRINTER_INFO; using default empty dict")
+                state_string = result.get("state") if isinstance(result, dict) else None
+                state_message = result.get("state_message") if isinstance(result, dict) else ""
+                if state_string is None:
+                    self._logger.debug("Missing key: response.result.state for QUERY_PRINTER_INFO; skipping state update")
+                else:
                     klippy_state = KlippyState.get_state_for_string(state_string)
-
                     if klippy_state != self._klippy_state or state_message != self._klippy_state_text:
                         self._set_klippy_state(klippy_state, state_message)
 
-
+            # Handle current request responses
             if self._current_request is not None:
-                if response["id"] == self._current_request.request["id"]:
-                    self._current_request.response_received_callback(response)
+                try:
+                    current_req_id = self._current_request.request.get("id") if isinstance(self._current_request.request, dict) else None
+                except Exception:
+                    current_req_id = None
+
+                if current_req_id is not None and resp_id == current_req_id:
+                    try:
+                        self._current_request.response_received_callback(response)
+                    except Exception:
+                        self._logger.exception("Error in current request response callback")
                     self._current_request = None
-            
-        
-        if 'method' in response:
-            # Subscribed printer objects are send with method: "notifiy_status_update"
-            # The subscribed objects are only published when the value has changed.
-            # e.g. bed_temperature target set to 50°, extruder temperature has changed, bed_temperature has changed, a.s.o.
-            if response['method'] == "notify_status_update":
-                #print(json.dumps(response, indent=3))
-                #TODO: Resource locking - possible data race!
-                json_pub_data = response["params"][0]
-                json_merged = merge(self.json_data_modell, json_pub_data)
-                with self.json_resouce_lock:
-                    printer_state_string = str(json_merged["print_stats"]["state"])
-                    read_printer_state = PrinterState.get_state_for_string(printer_state_string)
-                    if self._printer_state != read_printer_state:
-                        self._set_printer_state(read_printer_state)
-                    self.json_data_modell = json_merged
 
+        method = response.get("method")
+        if method is not None:
+            if method == "notify_status_update":
+                params = response.get("params", [])
+                if not params:
+                    self._logger.debug("Missing key: response.params for notify_status_update; skipping")
+                else:
+                    json_pub_data = params[0]
+                    try:
+                        json_merged = merge(self.json_data_modell, json_pub_data)
+                        with self.json_resouce_lock:
+                            printer_state_string = str(json_merged.get("print_stats", {}).get("state"))
+                            read_printer_state = PrinterState.get_state_for_string(printer_state_string)
+                            if self._printer_state != read_printer_state:
+                                self._set_printer_state(read_printer_state)
+                            self.json_data_modell = json_merged
+                    except Exception:
+                        self._logger.exception("Failed to process notify_status_update payload")
 
-                    
-                #print(json.dumps(self.json_data_modell["toolhead"]["homed_axes"], indent=3))
-                #print(json.dumps(json_merged, indent=2))
-
-
-            if response['method'] == "notify_klippy_ready":
+            if method == "notify_klippy_ready":
                 self.add_subscription(ws_app)
                 self._logger.info("Received: notifiy_klippy_ready")
                 self._set_klippy_state(KlippyState.READY)
 
-            if response['method'] == "notify_klippy_shutdown":
+            if method == "notify_klippy_shutdown":
                 self._logger.info("Received: notifiy_klippy_shutdown")
                 self._set_klippy_state(KlippyState.SHUTDOWN)
-                
 
-            if response['method'] == "notify_klippy_disconnected":
+            if method == "notify_klippy_disconnected":
                 self._logger.info("Received: notifiy_klippy_disconnected")
                 self._set_klippy_state(KlippyState.DISCONNECTED)
 
@@ -318,7 +326,7 @@ from distutils.log import error
                 return self.from_json(json_data)
 
         except FileNotFoundError:
-            self._logger.critical("Unable to read configuration from %s",websocket_json_config)
+            self._logger.critical("Unable to read configuration from %s", websocket_json_config)
             return False
             
 
@@ -327,9 +335,12 @@ from distutils.log import error
         with self.json_resouce_lock:
             json_obj = self.json_data_modell
             for dp in klipper_data:
+                if not isinstance(json_obj, dict):
+                    self._logger.debug("Expected dict while traversing klipper data path, got %s", type(json_obj))
+                    return None
                 json_obj = json_obj.get(dp)
                 if json_obj is None:
-                    print(f"Error Invalid Klipper Data {klipper_data}")
+                    self._logger.warning("Missing key in klipper data path: %s", dp)
                     return None
 
             if array_index >= 0:
