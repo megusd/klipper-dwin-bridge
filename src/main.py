@@ -1,18 +1,8 @@
  # 
- # This file is part of python-dgus (https://github.com/seho85/python-dgus).
- # Copyright (c) 2022 Sebastian Holzgreve
- # 
- # This program is free software: you can redistribute it and/or modify  
- # it under the terms of the GNU General Public License as published by  
- # the Free Software Foundation, version 3.
+ # Klipper DWIN Bridge - Main Entry Point
  #
- # This program is distributed in the hope that it will be useful, but 
- # WITHOUT ANY WARRANTY; without even the implied warranty of 
- # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
- # General Public License for more details.
- #
- # You should have received a copy of the GNU General Public License 
- # along with this program. If not, see <http://www.gnu.org/licenses/>.
+ # Python service for T5UID1 DWIN touchscreen communication with Klipper/Moonraker.
+ # Manages printer state display and touch input handling.
  #
 
 import argparse
@@ -20,6 +10,7 @@ import os
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-c', '--config_dir', type=str, help="Path to config directory")
+parser.add_argument('--dry-run', action='store_true', help='Run in dry-run mode: do not open serial port; print DRY-RUN messages instead of sending')
 args = parser.parse_args()
 
 config_dir = os.path.join(os.getcwd(), "..", "config")
@@ -40,9 +31,11 @@ with open(logger_json_file) as json_file:
 
 from signal import signal, SIGINT
 from time import sleep
-from dgus.display.communication.request import Request
-from dgus.display.communication.protocol import build_write_vp
-from dgus.display.communication.communication_interface import SerialCommunication
+
+from t5uid1_serial import T5UID1Serial
+from display_bridge import DisplayBridge
+from moonraker_display_mapper import MoonrakerDisplayMapper
+from touch_event_handler import TouchEventHandler
 from dgus.display.display import Display
 from dgus.display.mask import Mask
 
@@ -62,58 +55,170 @@ from moonraker.klippy_state import KlippyState
 
 logger = logging.getLogger(__name__)
 
-def emergency_stop_pressed(response : bytes):
-    
-    response_payload = response[7:]
-    keycode = int.from_bytes(response_payload, byteorder='big')
 
-    if keycode == 0xFFFF:
-        #TODO: define ID in request_id.py
-        emergeny_stop_rpc_cmd = {
-            "jsonrpc": "2.0",
-            "method": "printer.emergency_stop",
-            "id": 4564
-        }
-        global websock
-        websock.ws_app.send(json.dumps(emergeny_stop_rpc_cmd))
- 
+def handle_display_touch_event(response: bytes):
+    """Handle display touch events from spontaneous transmission."""
+    try:
+        if len(response) < 5:
+            return
+        
+        # Parse response frame
+        # Format: 0x5A 0xA5 [length] [command] [address_hi] [address_lo] [data...]
+        address = int.from_bytes(response[4:6], byteorder='big')
+        
+        logger.debug(f"Display touch event from address 0x{address:04x}")
+        
+        # TODO: Map touch events to actions based on address
+        # This will be implemented in task 5
+    except Exception as e:
+        logger.error(f"Error handling touch event: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
-      
-    
     
     logger.info("Using config directory: %s", config_dir)
 
-    PRINTER_IP = "10.0.1.69"
+    # Initialize Moonraker WebSocket connection
+    PRINTER_IP = "127.0.0.1"
     PORT = 7125
     websock = WebsocketInterface(PRINTER_IP, PORT)
 
-    SERIAL_PORT = "/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller-if00-port0"
-    serial_com = SerialCommunication(SERIAL_PORT)
-
-    
+    # Read serial configuration
     serial_config_file = os.path.join(config_dir, "serial_config.json")
-    serial_configuration_read = serial_com.read_json_config(serial_config_file)
-
-    websocket_config_file = os.path.join(config_dir, "websocket.json")
-    websocket_configuration_read = websock.read_json_config(websocket_config_file)
-
-    if not serial_configuration_read or not websocket_configuration_read:
-        if not serial_configuration_read:
-            logger.critical("Failed to read serial configuration! file: %s", serial_config_file)
-
-        if not websocket_configuration_read:
-            logger.critical("Failed to read websocket configuration! file: %s", websocket_config_file)
-
+    if not os.path.exists(serial_config_file):
+        logger.error(f"Serial config not found: {serial_config_file}")
         sys.exit(1)
     
-    serial_com.register_spontaneous_callback(0x0000, emergency_stop_pressed)
+    try:
+        with open(serial_config_file) as f:
+            serial_config = json.load(f)
+            serial_port = serial_config.get("com_interface", {}).get("serial_port", "/dev/ttyAMA0")
+            baudrate = serial_config.get("com_interface", {}).get("baudrate", 115200)
+    except Exception as e:
+        logger.error(f"Failed to read serial config: {e}")
+        sys.exit(1)
+    
+    logger.info(f"Using serial port: {serial_port} at {baudrate} baud")
+    
+    # Initialize T5UID1 serial interface (or dummy in dry-run)
+    if args.dry_run:
+        class DummySerial:
+            def __init__(self, port, baud):
+                self.port = port
+                self.baudrate = baud
+                self._com_opened = True
+                self._spontaneous = {}
+                self._port_state_callback = None
 
-    # Triggered when serial port has been reopened (e.G. USB-TTL reconnected)
-    def serial_port_state_changed(openend):
+            def register_spontaneous_callback(self, address, callback):
+                # store but won't be called since no real serial
+                self._spontaneous.setdefault(address, []).append(callback)
 
-        if openend:
-            print("Serial port openend...")
+            def set_port_state_callback(self, callback):
+                self._port_state_callback = callback
+
+            def start_com_thread(self):
+                # pretend we opened the port
+                self._com_opened = True
+                if self._port_state_callback:
+                    try:
+                        self._port_state_callback(True)
+                    except Exception:
+                        pass
+
+            def stop(self):
+                self._com_opened = False
+                if self._port_state_callback:
+                    try:
+                        self._port_state_callback(False)
+                    except Exception:
+                        pass
+
+            def queue_write_request(self, address, data):
+                print(f"DRY-RUN: addr=0x{address:04X} data={data.hex().upper()}")
+                return True
+
+            def queue_read_request(self, address, length):
+                # No real read — simulate empty response
+                print(f"DRY-RUN: read_request addr=0x{address:04X} len={length}")
+                # Optionally invoke spontaneous callbacks with zero data
+                callbacks = self._spontaneous.get(address, [])
+                for cb in callbacks:
+                    try:
+                        cb(bytes([0]*length))
+                    except Exception:
+                        pass
+                return True
+
+            def write_register(self, address, value, data_type='uint16'):
+                # Convert value to bytes for display
+                print(f"DRY-RUN: addr=0x{address:04X} data=0x{value:04X}")
+                return True
+
+            def write_string(self, address, value, max_length=32):
+                print(f"DRY-RUN: write_string addr=0x{address:04X} value='{value}'")
+                return True
+
+        t5uid1_serial = DummySerial(serial_port, baudrate)
+        logger.info("Running in DRY-RUN mode: serial port will not be opened")
+    else:
+        t5uid1_serial = T5UID1Serial(serial_port, baudrate)
+    
+    # Create display bridge adapter
+    display_bridge = DisplayBridge(t5uid1_serial)
+    
+    # Create Moonraker display mapper
+    display_mapper = MoonrakerDisplayMapper(t5uid1_serial, websock)
+    
+    # Create touch event handler
+    touch_handler = TouchEventHandler(websock)
+    
+    # Read websocket configuration
+    websocket_config_file = os.path.join(config_dir, "websocket.json")
+    if os.path.exists(websocket_config_file):
+        try:
+            with open(websocket_config_file) as f:
+                websocket_config = json.load(f)
+                ws_ip = websocket_config.get("websocket", {}).get("ip", PRINTER_IP)
+                ws_port = websocket_config.get("websocket", {}).get("port", PORT)
+                websock = WebsocketInterface(ws_ip, ws_port)
+        except Exception as e:
+            logger.warning(f"Failed to read websocket config: {e}, using defaults")
+    else:
+        logger.info(f"Websocket config not found, using defaults: {PRINTER_IP}:{PORT}")
+
+    # Register global display touch event handler
+    display_bridge.register_spontaneous_callback(0x0000, handle_display_touch_event)
+
+    # Register touch event callbacks from display to handler
+    from data_addresses import DataAddress
+    
+    def touch_event_router(address: int):
+        """Create a callback function for touch events at a specific address."""
+        def callback(data: bytes):
+            touch_handler.handle_touch_event(address, data)
+        return callback
+    
+    # Register all touch input addresses
+    touch_addresses = [
+        DataAddress.PAUSE_PRINT,
+        DataAddress.RESUME_PRINT,
+        DataAddress.ABORT_PRINT,
+        DataAddress.SET_FEEDRATE,
+        DataAddress.SET_FLOWRATE,
+        DataAddress.SET_Z_OFFSET,
+        DataAddress.ADJUST_Z_OFFSET,
+        DataAddress.TEMP_PRESET_SELECT,
+    ]
+    
+    for addr in touch_addresses:
+        display_bridge.register_spontaneous_callback(addr, touch_event_router(addr))
+
+    # Handle serial port state changes
+    def serial_port_state_changed(opened):
+        """Callback when serial port opens/closes."""
+        if opened:
+            logger.info("Serial port opened")
             act_mask = display.get_active_mask()
             
             mask_idx = 0
@@ -121,75 +226,105 @@ if __name__ == "__main__":
                 mask_idx = act_mask.mask_no
             
             display.switch_to_mask(mask_idx, False)
-    serial_com._serial_port_com_event_changed_receiver  = serial_port_state_changed
+        else:
+            logger.warning("Serial port closed")
+    
+    display_bridge.set_port_state_callback(serial_port_state_changed)
 
     run_main_thread = True
 
-    display = Display(serial_com)
+    # Initialize display manager
+    display = Display(display_bridge)
 
     def handleSIGINT(signum, frame):
-        #TODO: Add function in Display to retrieve active mask!
+        """Handle Ctrl+C gracefully."""
+        logger.info("Shutting down...")
+        
         if display._active_mask is not None:
             display._active_mask.mask_suppressed()
 
         websock.stop()
-        websock.write_json_config(os.path.join(config_dir, "websocket.json"))
-        serial_com.stop()
+        display_bridge.stop()
+        
         global run_main_thread
         run_main_thread = False
 
     signal(SIGINT, handleSIGINT)
 
+    # Start Moonraker connection
     websock.start()
 
-    startupMask = StartupMask(serial_com, websock)
+    # Add display masks
+    startupMask = StartupMask(display_bridge, websock)
     display.add_mask(startupMask)
       
-    overviewMask = OverviewDisplayMask(serial_com, websock)
+    overviewMask = OverviewDisplayMask(display_bridge, websock)
     display.add_mask(overviewMask)
     
-    mainMenuMask = Mask(30, serial_com)
+    mainMenuMask = Mask(30, display_bridge)
     display.add_mask(mainMenuMask)
 
-    axesMask =  AxesDisplayMask(serial_com, websock, display)
+    axesMask = AxesDisplayMask(display_bridge, websock, display)
     display.add_mask(axesMask)
 
-    tuningMask = TuningMask(serial_com, websock)
+    tuningMask = TuningMask(display_bridge, websock)
     display.add_mask(tuningMask)
 
-    extruderMask = ExtruderMask(serial_com, websock, display)
+    extruderMask = ExtruderMask(display_bridge, websock, display)
     display.add_mask(extruderMask)
 
-    fanMask = FanMask(serial_com, websock)
+    fanMask = FanMask(display_bridge, websock)
     display.add_mask(fanMask)
 
-    homeingInProgress = HomeingDisplayMask(51, serial_com, websock)
+    homeingInProgress = HomeingDisplayMask(51, display_bridge, websock)
     display.add_mask(homeingInProgress)
 
-    extruder_temp_to_low_mask = ExtruderTemperatureToLowMask(serial_com, websock)
+    extruder_temp_to_low_mask = ExtruderTemperatureToLowMask(display_bridge, websock)
     display.add_mask(extruder_temp_to_low_mask)
 
+    # Start communication thread
+    if display_bridge.start_com_thread():
+        logger.info("Serial communication thread started successfully")
+        
+        # Start display mapper (listens to Moonraker state changes)
+        display_mapper.start()
+        
+        # TODO: Initialize display state (read/write initial values)
+        # display.read_config_data_for_all_controls()
 
-    if serial_com.start_com_thread():
-        display.read_config_data_for_all_controls()
-        #display.write_config_data_for_all_controls()
-
+        # Switch to startup screen
         display.switch_to_mask(50)
+    else:
+        logger.error("Failed to start serial communication thread")
+        sys.exit(1)
 
-        #display.switch_to_mask(30)
-        #display.switch_to_mask(0)
-
-
-    def klippy_state_changed(state : KlippyState, state_message : str):
+    # Handle Klipper state changes
+    def klippy_state_changed(state: KlippyState, state_message: str):
+        """Callback when Klipper state changes."""
+        logger.info(f"Klipper state: {state} - {state_message}")
+        
         if state == KlippyState.READY:
+            logger.info("Klipper ready, switching to main menu")
             display.switch_to_mask(30, False)
             display.switch_to_mask(0)
-
-        else:# state == KlippyState.ERROR or state == KlippyState.SHUTDOWN:
+        else:
+            logger.info("Klipper not ready, showing startup screen")
             display.switch_to_mask(50, False)
 
     websock.register_klippy_state_event_receiver(klippy_state_changed)
 
-    while(run_main_thread):
-        display.update_current_mask()
-        sleep(0.2)
+    # Main event loop
+    logger.info("Starting main event loop")
+    try:
+        while run_main_thread:
+            display.update_current_mask()
+            sleep(0.2)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.error(f"Main loop error: {e}", exc_info=True)
+    finally:
+        logger.info("Main loop ended")
+        display_bridge.stop()
+        websock.stop()
+
