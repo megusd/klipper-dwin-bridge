@@ -16,94 +16,92 @@
  #
  
 from distutils.log import error
-import os
-import json
-from threading import Thread, Lock
-from time import sleep
-from typing import Any, Callable
-from websocket import WebSocketApp
-from jsonmerge import merge
-from queue import Queue
+        response = json.loads(msg)
+        # Use defensive gets to tolerate varying Moonraker responses
+        resp_id = response.get("id")
 
-from dgus.display.serialization.json_serializable import JsonSerializable
-from moonraker.request_id import WebsocktRequestId
-from moonraker.moonraker_request import MoonrakerRequest
+        if resp_id is not None:
+            # Response to our query data request
+            if resp_id == WebsocktRequestId.QUERY_PRINTER_OBJECTS:
+                status = response.get("result", {}).get("status")
+                if status is not None:
+                    with self.json_resouce_lock:
+                        json_merged = merge(self.json_data_modell, status)
+                        self.json_data_modell = json_merged
+                    self.add_subscription(ws_app)
+                else:
+                    self._logger.warning("Missing key: response.result.status")
 
-import logging
+            if resp_id == WebsocktRequestId.QUERY_SERVER_INFO:
+                result = response.get("result", {})
+                if result:
+                    with self.json_resouce_lock:
+                        existing = self.json_data_modell.get("server_info", {}) if isinstance(self.json_data_modell, dict) else {}
+                        try:
+                            json_merged = merge(existing, result)
+                            self.json_data_modell["server_info"] = json_merged
+                        except Exception:
+                            self._logger.exception("Failed to merge server_info response")
+                            self.json_data_modell["server_info"] = result
+                else:
+                    self._logger.warning("Missing key: response.result for server_info query")
 
-from moonraker.klippy_state import KlippyState
-from moonraker.printer_state import PrinterState
+            if resp_id == WebsocktRequestId.QUERY_PRINTER_INFO:
+                result = response.get("result", {})
+                state_string = result.get("state")
+                state_message = result.get("state_message")
+                if state_string is None:
+                    self._logger.warning("Missing key: response.result.state")
+                else:
+                    klippy_state = KlippyState.get_state_for_string(state_string)
+                    if klippy_state != self._klippy_state or state_message != self._klippy_state_text:
+                        self._set_klippy_state(klippy_state, state_message)
 
-class WebsocketInterface(JsonSerializable):
-    ws_app : WebSocketApp
-    thread : Thread
-    cyclic_query_thread : Thread
-    open : bool = False
-    printer_ip = "1.2.3.4"
-    port = 7125
-    json_data_modell = {}
-    server_info = {}
-    cyclic_query_thread_running = False
+            if self._current_request is not None:
+                current_req_id = None
+                try:
+                    current_req_id = self._current_request.request.get("id") if isinstance(self._current_request.request, dict) else None
+                except Exception:
+                    current_req_id = None
 
-    json_resouce_lock = Lock()
+                if current_req_id is not None and resp_id == current_req_id:
+                    try:
+                        self._current_request.response_received_callback(response)
+                    except Exception:
+                        self._logger.exception("Error in current request response callback")
+                    self._current_request = None
 
-    _requests : Queue = Queue()
-    _current_request : MoonrakerRequest = None
+        method = response.get("method")
+        if method is not None:
+            if method == "notify_status_update":
+                params = response.get("params", [])
+                if not params:
+                    self._logger.warning("Missing key: response.params for notify_status_update")
+                else:
+                    json_pub_data = params[0]
+                    try:
+                        json_merged = merge(self.json_data_modell, json_pub_data)
+                        with self.json_resouce_lock:
+                            printer_state_string = str(json_merged.get("print_stats", {}).get("state"))
+                            read_printer_state = PrinterState.get_state_for_string(printer_state_string)
+                            if self._printer_state != read_printer_state:
+                                self._set_printer_state(read_printer_state)
+                            self.json_data_modell = json_merged
+                    except Exception:
+                        self._logger.exception("Failed to process notify_status_update payload")
 
-    _logger = logging.getLogger(__name__)
+            if method == "notify_klippy_ready":
+                self.add_subscription(ws_app)
+                self._logger.info("Received: notifiy_klippy_ready")
+                self._set_klippy_state(KlippyState.READY)
 
-    _klippy_state : KlippyState = KlippyState.UNKOWN
-    _klippy_state_text : str = ""
-    _klippy_event_changed_callbacks = []
+            if method == "notify_klippy_shutdown":
+                self._logger.info("Received: notifiy_klippy_shutdown")
+                self._set_klippy_state(KlippyState.SHUTDOWN)
 
-    _printer_state : PrinterState = PrinterState.UNKNOWN
-    _printer_error_text : str = ""
-    _printer_state_event_changed_callbacks = []
-
-    query_req = {
-        "jsonrpc": "2.0",
-        "method": "printer.objects.query",
-        "params": {
-            "objects": {
-                "extruder": None,
-                "heater_bed": None
-            }
-        },
-        "id": WebsocktRequestId.QUERY_PRINTER_OBJECTS
-    }
-
-
-    subscription_request = {
-        "jsonrpc": "2.0",
-        "method": "printer.objects.subscribe",
-        "params": {
-            "objects": {
-                "heater_bed": None,
-                "extruder": None
-            }
-        },
-        "id": WebsocktRequestId.SUBSCRIBE_REQUEST
-    }
-
-
-    def __init__(self, printer_ip, port) -> None:
-        self.printer_ip = printer_ip
-        self.port = port
-
-        self.create_websocket()
-        
-
-    def create_websocket(self):
-
-        ws_url = f"ws://{self.printer_ip}:{str(self.port)}/websocket?token="
-
-        self._logger.info("Using websocket URL: %s", ws_url)
-       
-        def on_close(ws_app, close_status, close_msg):
-            self.ws_on_close(ws_app, close_status, close_msg)
-
-        def on_error(ws_app, error):
-            self.ws_on_error(ws_app, error)
+            if method == "notify_klippy_disconnected":
+                self._logger.info("Received: notifiy_klippy_disconnected")
+                self._set_klippy_state(KlippyState.DISCONNECTED)
 
         def on_message(ws_app, msg):
             self.ws_on_message(ws_app,msg)
