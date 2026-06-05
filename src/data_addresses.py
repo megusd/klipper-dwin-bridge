@@ -1,103 +1,81 @@
- # 
- # This file is part of python-dgus (https://github.com/seho85/python-dgus).
- # Copyright (c) 2022 Sebastian Holzgreve
- # 
- # This program is free software: you can redistribute it and/or modify  
- # it under the terms of the GNU General Public License as published by  
- # the Free Software Foundation, version 3.
  #
- # This program is distributed in the hope that it will be useful, but 
- # WITHOUT ANY WARRANTY; without even the implied warranty of 
- # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU 
- # General Public License for more details.
- #
- # You should have received a copy of the GNU General Public License 
- # along with this program. If not, see <http://www.gnu.org/licenses/>.
- #
- 
+# T5UID1 Register Addresses
+#
+# Register map for DMT48270C043_06WT DWIN display using T5UID1 protocol
+# Based on desuuuu's Klipper-DGUS-reloaded project
+# Reference: _reference/desuuuu-klipper/klippy/extras/t5uid1/dgus_reloaded/
+#
 
 from enum import IntEnum
 
-#TODO: Rename to DGUS RAM 
+
 class DataAddress(IntEnum):
+    """
+    T5UID1 Register Addresses for touchscreen display communication.
     
-    #Spontanous Transmission
-    SPONT_MOVE_DISTANCE = 0x0005
-
-
-    SPONT_EXTRUDER_TEMP_SETPOINT = 0x0010
-    SPONT_BED_TEMP_SETPOINT = 0x0011
-
-    SPONT_MOVE_BUTTON = 0x0012
-
-    SPONT_ZOFFET_DISTANCE = 0x0014
-    SPONT_ZOFFSET_BUTTON = 0x0013
-    SPONT_SPEED_FACTOR_SETPOINT = 0x0015
-    SPONT_EXTRUSION_FACTOR_SETPOINT = 0x0016
+    These addresses correspond to the DGUS variable map in the desuuuu
+    DGUS-reloaded firmware for T5UID1 displays.
+    """
     
-    SPONT_OVERVIEW_MASK_BUTTON = 0x0017
-
-    ########################################
-
-    #OverView Mask
-    TEMPERATURE_EXTRUDER = 0x1000
-    TARGET_TEMPERATURE_EXTRUDER = 0x1010
-
-    TEMPERATURE_BED = 0x1020
-    TARGET_TEMPERATURE_BED = 0x1030
-
-    KLIPPY_STATE = 0x1060
-    PRINTER_STATE = 0x1080
-
-    PRINT_TIME_TOTAL = 0x2000
-    PRINT_TIME_TILL_FINISHED = 0x2010
-    PRINT_PERCENT = 0x2020
-
-
-    LIVE_X_POS = 0x2030
-    LIVE_Y_POS = 0x2032
-    LIVE_Z_POS = 0x2034
-
-    #HomingMask
-    HOMED_AXES = 0x2040
-
-    #TuningMask
-    SPEED_FACTOR = 0x5001
-    EXTRUSION_FACTOR = 0x5010
-    Z_OFFSET_BITICON = 0x5030
-
-    Z_OFFSET = 0x5020
-
+    # ===== OUTPUT VARIABLES (Display <- Host) =====
+    
+    # Status Text Lines (32 bytes each)
+    STATUS_LINE1 = 0x1100
+    STATUS_LINE2 = 0x1120
+    STATUS_LINE3 = 0x1140
+    STATUS_LINE4 = 0x1160
+    
+    # Main Status Message (32 bytes)
+    STATUS_MESSAGE = 0x3000
+    
+    # Print Status
+    STATUS_PRINT_PROGRESS = 0x30f6  # uint16, 0-100%
+    STATUS_PRINT_ELAPSED = 0x30e7   # str (15 bytes), formatted duration
+    STATUS_PRINT_Z_POS = 0x30e6     # int16, Z position × 10
+    
+    # Temperature Readings (int16, in °C)
+    TEMP_HOTEND_CURRENT = 0x30ff    # Current extruder temperature
+    TEMP_HOTEND_TARGET = 0x3100     # Target extruder temperature
+    TEMP_HOTEND_MAX = 0x3101        # Max extruder temperature
+    
+    TEMP_BED_CURRENT = 0x30fc       # Current bed temperature
+    TEMP_BED_TARGET = 0x30fd        # Target bed temperature
+    TEMP_BED_MAX = 0x30fe           # Max bed temperature
+    
+    # Second extruder (if available)
+    TEMP_HOTEND1_CURRENT = 0x3102
+    TEMP_HOTEND1_TARGET = 0x3103
+    
+    # Speed/Flow Adjustments (int16, in %)
+    ADJUST_FEEDRATE = 0x30f8        # Speed factor percentage
+    ADJUST_FLOWRATE = 0x30f9        # Extrusion factor percentage
+    
+    # ===== INPUT VARIABLES (Display -> Host) =====
+    
+    # Page Navigation
+    SWITCH_PAGE = 0x2000            # Switch to page (uint16)
+    SWITCH_PAGE_IF_IDLE = 0x2002    # Switch page only if idle
+    SWITCH_PAGE_IF_PRINTING = 0x2003  # Switch page only if printing
+    
+    # Print Control
+    ABORT_PRINT = 0x2007            # Cancel/abort print
+    PAUSE_PRINT = 0x2008            # Pause print
+    RESUME_PRINT = 0x2009           # Resume print
+    
+    # Speed/Flow Adjustment (int16)
+    SET_FEEDRATE = 0x200a           # Set speed factor (M220 S{value})
+    SET_FLOWRATE = 0x200b           # Set flow factor (M221 S{value})
+    
+    # Z-Offset Adjustment (int16)
+    SET_Z_OFFSET = 0x200e           # Set Z-offset (in 0.01mm units)
+    ADJUST_Z_OFFSET = 0x200f        # Increment/decrement Z-offset
+    
+    # Temperature Presets
+    TEMP_PRESET_SELECT = 0x2010     # Select temp preset (PLA/ABS/PETG)
+    
+    # ===== LEGACY/COMPATIBILITY =====
+    # (Kept for potential backward compatibility)
+    
     UNDEFINED = 0xFFFF
-
-
-    #AxesDisplayMask
-
-    MOVE_DISTANCE_BITICON = 0x2036
-
-
-    #ExtruderDisplayMask
-    FEED_AMOUNT_BITICON = 0x2050
-    FEED_RATE_BITICON = 0x2051
-
-    SPONT_EXTRUDER_MASK_BUTTON = 0x0020
-    SPONT_EXTRUDER_FEED_RATE_SETPOINT = 0x0021
-    SPONT_EXTRUDER_FEED_AMOUNT_SETPOINT = 0x0022
-    
-    #Temperature Low Mask
-    MIN_EXTRUDE_TEMPERATURE = 0x2052
-
-
-    #FAN/LED Mask
-    EXTRUDER_FAN_SPEED_SETPOINT = 0x2054
-    
-    SPONT_EXTRUDER_FAN_SPEED_SETPOINT_ASCII = 0x0023
-    SPONT_LED_CONTROL_BUTTON = 0x0024
-
-
-    #STARTUP MASK
-    KLIPPY_STATE_TEXT = 0x5040
-    #TODO Name SPONT_
-    START_MASK_BUTTON = 0x0025
 
 
