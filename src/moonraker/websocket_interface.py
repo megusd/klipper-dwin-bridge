@@ -215,8 +215,16 @@ class WebsocketInterface(JsonSerializable):
 
                 #self.server_info = response["resut"]
                 with self.json_resouce_lock:
-                    json_merged = merge(self.json_data_modell["server_info"], response["result"] )
-                    self.json_data_modell["server_info"] = json_merged
+                    # Be defensive: the data model may not contain a server_info key yet
+                    existing = self.json_data_modell.get("server_info", {}) if isinstance(self.json_data_modell, dict) else {}
+                    result = response.get("result", {}) if isinstance(response, dict) else {}
+                    try:
+                        json_merged = merge(existing, result)
+                        self.json_data_modell["server_info"] = json_merged
+                    except Exception:
+                        # If merging fails for any reason, log and store the raw result safely
+                        self._logger.exception("Failed to merge server_info response")
+                        self.json_data_modell["server_info"] = result
 
                     #print(json.dumps(response, indent=3))
 
